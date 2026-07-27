@@ -1,0 +1,4 @@
+beautifulsoup4
+colorama
+PyQt5
+selenium
