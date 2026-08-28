@@ -1,4 +1,6 @@
 from datetime import datetime
+import io
+import os
 import re
 import time
 
@@ -64,6 +66,45 @@ def _append_unique(items, value):
         items.append(value)
 
 
+def _filename_basename(value):
+    return str(value or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
+
+
+def _filename_match_key(value):
+    basename = _filename_basename(value).casefold()
+    basename = re.sub(r"\.html?$", "", basename)
+    return basename.replace("_e2e", "")
+
+
+def _filename_family_key(value):
+    return re.sub(r"(counsel)(?:-\d+)?$", r"\1", _filename_match_key(value))
+
+
+def _filename_query_variants(expected_filename):
+    basename = _filename_basename(expected_filename)
+    if not basename:
+        return []
+
+    if "." in basename:
+        stem, _extension = basename.rsplit(".", 1)
+        no_e2e_stem = re.sub(r"_e2e", "", stem, flags=re.IGNORECASE)
+    else:
+        no_e2e_stem = re.sub(r"_e2e", "", basename, flags=re.IGNORECASE)
+    no_e2e_stem = re.sub(r"(counsel)(?:-\d+)?$", r"\1", no_e2e_stem, flags=re.IGNORECASE)
+    return [f"*{no_e2e_stem}*"]
+
+
+def _docket_pattern(docket_number):
+    docket = str(docket_number or "").strip()
+    if "-" in docket:
+        left, right = docket.split("-", 1)
+        return re.compile(
+            rf"(?<!\d){re.escape(left)}\s*[-–—]?\s*{re.escape(right)}(?!\d)",
+            re.IGNORECASE,
+        )
+    return re.compile(re.escape(docket), re.IGNORECASE)
+
+
 def usap_codes_for_duplicate_route(route_value):
     route_value = str(route_value or "").strip()
     code = canonical_usap_code(route_value)
@@ -125,6 +166,7 @@ class IRTDuplicateChecker:
 
     IRT_RESULTS_TIMEOUT = 120
     IRT_STARTUP_ATTEMPTS = 3
+    OCR_SCREENSHOT_PASSES = 4
     NO_RESULT_MARKERS = (
         "no matching records",
         "no data available",
@@ -138,6 +180,8 @@ class IRTDuplicateChecker:
         self.stop_event = stop_event
         self.driver = None
         self._initialized = False
+        self._ocr_unavailable_reason = None
+        self._ocr_unavailable_logged = False
 
     def _create_driver(self):
         return session(headless=self.headless)
@@ -377,6 +421,10 @@ class IRTDuplicateChecker:
                     const foundIndex = headerTexts.indexOf(normalizeHeader(headerName));
                     return foundIndex >= 0 ? foundIndex : fallbackIndex;
                 };
+                const hrefsOf = (row) =>
+                    Array.from(row.querySelectorAll("a[href]"))
+                        .map((link) => (link.getAttribute("href") || "").trim())
+                        .filter((href) => href && !href.toLowerCase().startsWith("javascript:"));
                 const lniIndex = headerIndex("LNI", 0);
                 const fileNameIndex = headerIndex("File Name", 1);
                 const receivedDateIndex = headerIndex("Received Date", 6);
@@ -391,6 +439,7 @@ class IRTDuplicateChecker:
                         "LNI": textOf(cells, lniIndex),
                         "File Name": fileName,
                         "Received Date": textOf(cells, receivedDateIndex),
+                        "Links": hrefsOf(row),
                     });
                 }
                 return records;
@@ -412,39 +461,15 @@ class IRTDuplicateChecker:
                         "LNI": cells[0].text.strip(),
                         "File Name": file_name,
                         "Received Date": cells[6].text.strip() if len(cells) > 6 else "",
+                        "Links": [
+                            link.get_attribute("href") or ""
+                            for link in row.find_elements(By.CSS_SELECTOR, "a[href]")
+                        ],
                     }
                 )
             return records
 
-    def find_existing_counsel(self, court_code, docket_number, start_date, end_date):
-        self._initialize()
-        raise_if_cancelled(self.stop_event)
-        _log(
-            self.logger,
-            f"Checking IRT duplicate: court={court_code}, docket={docket_number}, filename=*counsel*",
-        )
-
-        self._set_field(self.COURT_CODE_XPATH, court_code)
-        self._set_field(self.DOCKET_NUMBER_XPATH, docket_number)
-        self._set_field(self.FILE_NAME_XPATH, "*counsel*")
-        self._set_field(self.DATE_FROM_XPATH, start_date)
-        self._set_field(self.DATE_TO_XPATH, end_date)
-
-        try:
-            self._click_search_and_wait()
-        except TimeoutException:
-            _log(self.logger, f"No IRT results confirmed for docket {docket_number}.")
-            return None
-
-        records = [
-            record
-            for record in self._extract_records()
-            if re.search(re.escape(docket_number), record.get("File Name", ""), re.IGNORECASE)
-            or re.search(re.escape(docket_number), record.get("LNI", ""), re.IGNORECASE)
-        ]
-        if not records:
-            records = self._extract_records()
-
+    def _latest_record(self, records):
         latest = None
         latest_dt = None
         for record in records:
@@ -452,22 +477,272 @@ class IRTDuplicateChecker:
             if latest is None or (received_dt is not None and (latest_dt is None or received_dt > latest_dt)):
                 latest = record
                 latest_dt = received_dt
-
-        if latest:
-            _log(
-                self.logger,
-                f"IRT duplicate found for {docket_number}: LNI={latest.get('LNI', '')}, "
-                f"Received Date={latest.get('Received Date', '')}",
-            )
-        else:
-            _log(self.logger, f"No IRT duplicate found for {docket_number}.")
         return latest
 
-    def find_existing_counsel_any(self, court_codes, docket_number, start_date, end_date):
+    def _matching_records(self, records, docket_number, expected_filename=None):
+        if expected_filename:
+            expected_key = _filename_match_key(expected_filename)
+            return [
+                record
+                for record in records
+                if _filename_match_key(record.get("File Name", "")) == expected_key
+            ]
+
+        docket_pattern = re.compile(re.escape(docket_number), re.IGNORECASE)
+        matching_records = [
+            record
+            for record in records
+            if docket_pattern.search(record.get("File Name", ""))
+        ]
+        return matching_records or records
+
+    def _filename_family_records(self, records, expected_filename, include_exact=False):
+        family_key = _filename_family_key(expected_filename)
+        exact_key = _filename_match_key(expected_filename)
+        return [
+            record
+            for record in records
+            if _filename_family_key(record.get("File Name", "")) == family_key
+            and (include_exact or _filename_match_key(record.get("File Name", "")) != exact_key)
+        ]
+
+    def _record_links(self, record):
+        links = []
+        for link in record.get("Links") or []:
+            link = str(link or "").strip()
+            if link and link not in links:
+                links.append(link)
+        return links[:3]
+
+    def _ocr_modules(self):
+        if self._ocr_unavailable_reason:
+            return None, None
+
+        try:
+            from PIL import Image, ImageFilter, ImageOps
+            import pytesseract
+        except ImportError as exc:
+            self._ocr_unavailable_reason = (
+                "OCR fallback unavailable because Pillow/pytesseract is not installed."
+            )
+            return None, None
+
+        tesseract_cmd = os.getenv("TESSERACT_CMD", "").strip()
+        if tesseract_cmd:
+            pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+
+        try:
+            pytesseract.get_tesseract_version()
+        except Exception as exc:
+            self._ocr_unavailable_reason = (
+                "OCR fallback unavailable because the Tesseract engine could not be started. "
+                "Install Tesseract OCR or set TESSERACT_CMD to tesseract.exe."
+            )
+            return None, None
+
+        return (Image, ImageFilter, ImageOps), pytesseract
+
+    def _log_ocr_unavailable_once(self):
+        if self._ocr_unavailable_reason and not self._ocr_unavailable_logged:
+            _log(self.logger, self._ocr_unavailable_reason, level="WARNING")
+            self._ocr_unavailable_logged = True
+
+    def _ocr_page_mentions_docket(self, docket_number):
+        image_modules, pytesseract = self._ocr_modules()
+        if not image_modules or not pytesseract:
+            self._log_ocr_unavailable_once()
+            return False
+
+        Image, ImageFilter, ImageOps = image_modules
+        docket_pattern = _docket_pattern(docket_number)
+        try:
+            viewport_height = int(
+                self.driver.execute_script("return Math.max(window.innerHeight || 0, 700);")
+                or 700
+            )
+            scroll_height = int(
+                self.driver.execute_script(
+                    "return Math.max(document.body.scrollHeight || 0, document.documentElement.scrollHeight || 0);"
+                )
+                or viewport_height
+            )
+        except WebDriverException:
+            viewport_height = 700
+            scroll_height = viewport_height
+
+        max_scroll = max(0, scroll_height - viewport_height)
+        if self.OCR_SCREENSHOT_PASSES <= 1 or max_scroll == 0:
+            offsets = [0]
+        else:
+            offsets = [
+                int(max_scroll * index / (self.OCR_SCREENSHOT_PASSES - 1))
+                for index in range(self.OCR_SCREENSHOT_PASSES)
+            ]
+
+        for offset in offsets:
+            raise_if_cancelled(self.stop_event)
+            try:
+                self.driver.execute_script("window.scrollTo(0, arguments[0]);", offset)
+                time.sleep(0.25)
+                png_bytes = self.driver.get_screenshot_as_png()
+                image = Image.open(io.BytesIO(png_bytes))
+                image = ImageOps.grayscale(image)
+                image = image.resize((image.width * 2, image.height * 2))
+                image = ImageOps.autocontrast(image)
+                image = image.filter(ImageFilter.SHARPEN)
+                text = pytesseract.image_to_string(image, config="--psm 6")
+                if docket_pattern.search(text):
+                    return True
+            except Exception as exc:
+                self._ocr_unavailable_reason = f"OCR fallback failed while reading the IRT candidate page: {exc}"
+                self._log_ocr_unavailable_once()
+                return False
+
+        return False
+
+    def _linked_record_mentions_docket(self, record, docket_number):
+        links = self._record_links(record)
+        if not links:
+            return False
+
+        original_handle = self.driver.current_window_handle
+        docket_pattern = _docket_pattern(docket_number)
+        for link in links:
+            raise_if_cancelled(self.stop_event)
+            opened_handle = None
+            try:
+                existing_handles = set(self.driver.window_handles)
+                self.driver.execute_script("window.open(arguments[0], '_blank');", link)
+                WebDriverWait(self.driver, 10).until(
+                    lambda driver: len(set(driver.window_handles) - existing_handles) > 0
+                )
+                opened_handle = next(
+                    handle for handle in self.driver.window_handles if handle not in existing_handles
+                )
+                self.driver.switch_to.window(opened_handle)
+                WebDriverWait(self.driver, 15).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "body"))
+                )
+                time.sleep(0.5)
+                body_text = self.driver.find_element(By.TAG_NAME, "body").text
+                page_source = self.driver.page_source
+                if docket_pattern.search(f"{body_text}\n{page_source}"):
+                    return True
+                if self._ocr_page_mentions_docket(docket_number):
+                    return True
+            except WebDriverException:
+                continue
+            finally:
+                try:
+                    if opened_handle and opened_handle in self.driver.window_handles:
+                        self.driver.close()
+                except WebDriverException:
+                    pass
+                try:
+                    if original_handle in self.driver.window_handles:
+                        self.driver.switch_to.window(original_handle)
+                except WebDriverException:
+                    pass
+        return False
+
+    def _content_verified_records(self, records, docket_number):
+        verified = []
+        for record in records:
+            if self._linked_record_mentions_docket(record, docket_number):
+                verified.append(record)
+        return verified
+
+    def find_existing_counsel(self, court_code, docket_number, start_date, end_date, expected_filename=None):
+        self._initialize()
+        raise_if_cancelled(self.stop_event)
+
+        search_attempts = []
+        if expected_filename:
+            for filename_query in _filename_query_variants(expected_filename):
+                search_attempts.append(("", filename_query, expected_filename))
+            search_attempts.append((docket_number, "*counsel*", expected_filename))
+        else:
+            search_attempts.append((docket_number, "*counsel*", None))
+
+        for docket_query, filename_query, filename_filter in search_attempts:
+            _log(
+                self.logger,
+                f"Checking IRT duplicate: court={court_code}, docket={docket_number}, filename={filename_query}",
+            )
+
+            self._set_field(self.COURT_CODE_XPATH, court_code)
+            self._set_field(self.DOCKET_NUMBER_XPATH, docket_query)
+            self._set_field(self.FILE_NAME_XPATH, filename_query)
+            self._set_field(self.DATE_FROM_XPATH, start_date)
+            self._set_field(self.DATE_TO_XPATH, end_date)
+
+            try:
+                self._click_search_and_wait()
+            except TimeoutException:
+                _log(self.logger, f"No IRT results confirmed for docket {docket_number}.")
+                continue
+
+            extracted_records = self._extract_records()
+            records = self._matching_records(extracted_records, docket_number, expected_filename=filename_filter)
+            family_records = (
+                self._filename_family_records(extracted_records, filename_filter, include_exact=True)
+                if filename_filter
+                else []
+            )
+            content_verification_required = filename_filter and len(family_records) > 1
+            if content_verification_required:
+                records = self._content_verified_records(family_records, docket_number)
+                if not records:
+                    _log(
+                        self.logger,
+                        f"Found {len(family_records)} related IRT counsel filename(s) for {docket_number}, "
+                        "but none could be content-verified; not recycling an LNI.",
+                        level="WARNING",
+                    )
+            latest = self._latest_record(records)
+            if latest:
+                verification_note = " content-verified" if content_verification_required else ""
+                _log(
+                    self.logger,
+                    f"IRT duplicate{verification_note} found for {docket_number}: "
+                    f"LNI={latest.get('LNI', '')}, "
+                    f"Received Date={latest.get('Received Date', '')}",
+                )
+                return latest
+
+            if filename_filter and not content_verification_required:
+                candidates = self._filename_family_records(extracted_records, filename_filter)
+                verified_records = self._content_verified_records(candidates, docket_number)
+                latest = self._latest_record(verified_records)
+                if latest:
+                    _log(
+                        self.logger,
+                        f"IRT duplicate content-verified for {docket_number}: "
+                        f"LNI={latest.get('LNI', '')}, Received Date={latest.get('Received Date', '')}",
+                    )
+                    return latest
+                if candidates:
+                    _log(
+                        self.logger,
+                        f"Found {len(candidates)} related IRT counsel filename(s) for {docket_number}, "
+                        "but none could be content-verified; not recycling an LNI.",
+                        level="WARNING",
+                    )
+
+        _log(self.logger, f"No IRT duplicate found for {docket_number}.")
+        return None
+
+    def find_existing_counsel_any(self, court_codes, docket_number, start_date, end_date, expected_filename=None):
         matches = []
         for court_code in court_codes:
             raise_if_cancelled(self.stop_event)
-            record = self.find_existing_counsel(court_code, docket_number, start_date, end_date)
+            record = self.find_existing_counsel(
+                court_code,
+                docket_number,
+                start_date,
+                end_date,
+                expected_filename=expected_filename,
+            )
             if not record:
                 continue
             match = dict(record)

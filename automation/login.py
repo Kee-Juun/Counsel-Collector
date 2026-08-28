@@ -1,6 +1,13 @@
 import logging
+import time
 
-from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    NoSuchElementException,
+    StaleElementReferenceException,
+    TimeoutException,
+    WebDriverException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
@@ -8,6 +15,31 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 from automation.cancellation import raise_if_cancelled, sleep_with_cancel
 from config.app_settings import LEXIS_HOME_URL, PROJECT_ROOT
+
+
+NEXT_BUTTON_CANDIDATES = (
+    (By.ID, "signInSbmtBtn"),
+    (By.XPATH, "//*[@id='signInSbmtBtn']"),
+    (By.XPATH, "//*[@type='submit' and normalize-space(@value)='Next']"),
+    (By.XPATH, "//button[normalize-space()='Next']"),
+    (By.XPATH, "//*[@role='button' and normalize-space()='Next']"),
+    (By.XPATH, "//*[self::button or self::input or @role='button'][contains(normalize-space(.), 'Next')]"),
+)
+
+SIGN_IN_BUTTON_CANDIDATES = (
+    (By.ID, "next"),
+    (By.XPATH, "//*[@id='next']"),
+    (By.XPATH, "//*[@type='submit' and normalize-space(@value)='Sign In']"),
+    (By.XPATH, "//*[@type='submit' and normalize-space(@value)='Sign in']"),
+    (By.XPATH, "//button[normalize-space()='Sign In' or normalize-space()='Sign in']"),
+    (By.XPATH, "//*[@role='button' and (normalize-space()='Sign In' or normalize-space()='Sign in')]"),
+    (
+        By.XPATH,
+        "//*[self::button or self::input or @role='button']"
+        "[contains(translate(normalize-space(.), 'SIGN', 'sign'), 'sign in') "
+        "or contains(translate(@value, 'SIGN', 'sign'), 'sign in')]",
+    ),
+)
 
 
 def _is_displayed(driver, xpath):
@@ -85,6 +117,54 @@ def _dismiss_cookie_banner(driver):
     return False
 
 
+def _wait_document_ready(driver, timeout=15):
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda active_driver: active_driver.execute_script("return document.readyState") == "complete"
+        )
+    except TimeoutException:
+        logging.info("Lexis login page did not report document.readyState=complete before timeout.")
+
+
+def _find_first_clickable(driver, candidates, timeout=15, stop_event=None):
+    deadline = time.time() + timeout
+    last_error = None
+    while time.time() < deadline:
+        raise_if_cancelled(stop_event)
+        for by, value in candidates:
+            try:
+                element = WebDriverWait(driver, 1).until(EC.element_to_be_clickable((by, value)))
+                return element, by, value
+            except (TimeoutException, StaleElementReferenceException, WebDriverException) as exc:
+                last_error = exc
+        sleep_with_cancel(0.25, stop_event)
+    raise TimeoutException(str(last_error) if last_error else "No clickable login button candidate found.")
+
+
+def _click_first_login_button(driver, label, candidates, timeout=15, retries=2, stop_event=None):
+    last_error = None
+    for attempt in range(1, retries + 1):
+        raise_if_cancelled(stop_event)
+        try:
+            element, by, value = _find_first_clickable(driver, candidates, timeout=timeout, stop_event=stop_event)
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+            sleep_with_cancel(0.25, stop_event)
+            try:
+                element.click()
+            except (ElementClickInterceptedException, WebDriverException):
+                driver.execute_script("arguments[0].click();", element)
+            logging.info(f"Clicked Lexis {label} button using {by}={value}.")
+            return True
+        except (TimeoutException, StaleElementReferenceException, WebDriverException) as exc:
+            last_error = exc
+            logging.warning(f"Lexis {label} button click attempt {attempt}/{retries} failed: {exc}")
+            if attempt < retries:
+                sleep_with_cancel(1, stop_event)
+
+    logging.warning(f"Could not click Lexis {label} button after {retries} attempt(s): {last_error}")
+    return False
+
+
 def LPLogin(username, password, driver, stop_event=None):
     raise_if_cancelled(stop_event)
     driver.get(LEXIS_HOME_URL)
@@ -108,7 +188,17 @@ def LPLogin(username, password, driver, stop_event=None):
             user_input.send_keys(username)
             _dismiss_cookie_banner(driver)
             raise_if_cancelled(stop_event)
-            driver.find_element(By.ID, "signInSbmtBtn").click()
+            if not _click_first_login_button(
+                driver,
+                "Next",
+                NEXT_BUTTON_CANDIDATES,
+                timeout=15,
+                retries=2,
+                stop_event=stop_event,
+            ):
+                _report_login_state(driver, "Could not click the Lexis Next button after entering the User ID.")
+                return False
+            _wait_document_ready(driver)
 
             try:
                 password_input = WebDriverWait(driver, 30).until(EC.element_to_be_clickable((By.ID, "password")))
@@ -125,7 +215,18 @@ def LPLogin(username, password, driver, stop_event=None):
             raise_if_cancelled(stop_event)
             password_input.clear()
             password_input.send_keys(password)
-            password_input.send_keys(Keys.ENTER)
+            logging.info("Lexis password entered.")
+            _dismiss_cookie_banner(driver)
+            if not _click_first_login_button(
+                driver,
+                "Sign In",
+                SIGN_IN_BUTTON_CANDIDATES,
+                timeout=15,
+                retries=2,
+                stop_event=stop_event,
+            ):
+                logging.info("Lexis Sign In button was not clickable; submitting password with Enter.")
+                password_input.send_keys(Keys.ENTER)
             return LPCheck(driver, stop_event=stop_event)
 
         except (TimeoutException, WebDriverException) as exc:

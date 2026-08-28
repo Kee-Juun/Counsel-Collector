@@ -1,12 +1,14 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_submodules
+
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
     datas=[('assets', 'assets')],
-    hiddenimports=['bs4', 'selenium'],
+    hiddenimports=['bs4', 'colorama'] + collect_submodules('selenium') + collect_submodules('PIL') + collect_submodules('pytesseract'),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

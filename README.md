@@ -32,7 +32,7 @@ python main.py
 - Pasted docket lists can include court suffixes such as `_CA4`, `_CA8`, `_CA9`, `_CA11`, or `_CADC`. When suffixes are detected, the app automatically selects the matching courts, groups the docket numbers, and strips the suffixes before searching Lexis.
 - Feedback-form rows using `USAPDCORD` route to D.C. Circuit. A `u` immediately after the docket in the filename, such as `LDC_SMD_23-5034u_E2E_PCQ.pdf`, routes output to `USADCU`; otherwise output routes to `USAPDC`. The `Renamed` sheet keeps `USAPDCORD` in the court column and removes that `u` marker from filenames.
 - Lexis accepts up to 10 docket numbers per search, so the app automatically splits larger court lists into 10-docket batches while keeping all output in the same court folder.
-- Before CourtLink collection starts, the app checks IRT for existing counsel files using the routed court code, docket number, filename pattern `*counsel*`, and a two-year received-date window ending today. Dockets already found in IRT are skipped and documented in the `Renamed` sheet with `RECYCLED COUNSEL LNI` and `MOST RECENT RECEIVED DATE`.
+- Before CourtLink collection starts, the app checks IRT for existing counsel files using the routed court code, docket number, expected counsel filename when available, and a two-year received-date window ending today. Dockets already found in IRT are skipped and documented in the `Renamed` sheet with `RECYCLED COUNSEL LNI` and `MOST RECENT RECEIVED DATE`. When multiple related counsel filenames exist, the app verifies candidate content before recycling the LNI; if normal page text cannot be verified, it can use OCR as a fallback when Tesseract OCR is installed.
 
 Example smart paste:
 
@@ -125,3 +125,5 @@ Install with:
 ```cmd
 pip install -r requirements.txt
 ```
+
+The optional OCR fallback requires the Tesseract OCR engine to be installed on the machine. If `tesseract.exe` is not on `PATH`, set the `TESSERACT_CMD` environment variable to its full path.

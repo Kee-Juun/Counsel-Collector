@@ -1,4 +1,6 @@
 beautifulsoup4
 colorama
+pillow
+pytesseract
 PyQt5
 selenium

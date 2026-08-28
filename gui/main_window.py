@@ -69,6 +69,7 @@ from utils.docket_input import (
     docket_lines,
     merge_dockets,
     normalize_dockets,
+    parse_ca_feedback_rows,
     parse_court_coded_dockets,
     parse_feedback_renamed_rows,
     parse_usap_docket_rows,
@@ -2742,10 +2743,29 @@ class CounselCollectorWindow(QMainWindow):
         output_filenames_by_folder = {}
         renamed_rows = []
         found_usap_jobs = False
+        found_ca_feedback_jobs = False
         found_coded_dockets = False
         self.directory_copy_target = None
 
         for source_court, raw_dockets in docket_map.items():
+            ca_jobs, ca_renamed_rows = parse_ca_feedback_rows(raw_dockets)
+            if ca_jobs:
+                found_ca_feedback_jobs = True
+                renamed_rows.extend(ca_renamed_rows)
+                for job in ca_jobs:
+                    court_label = job["court_label"]
+                    output_folder = job["output_folder"]
+                    dockets = job["docket_numbers"]
+                    routed_map[court_label] = merge_dockets(routed_map.get(court_label, ""), dockets)
+                    key = (court_label, output_folder)
+                    output_jobs_by_folder[key] = merge_dockets(output_jobs_by_folder.get(key, ""), dockets)
+                    filename_map = job.get("docket_output_filenames") or {}
+                    if filename_map:
+                        target_map = output_filenames_by_folder.setdefault(key, {})
+                        for docket, filename in filename_map.items():
+                            target_map.setdefault(docket, filename)
+                continue
+
             renamed_rows.extend(parse_feedback_renamed_rows(raw_dockets))
             usap_jobs, usap_plain = parse_usap_docket_rows(raw_dockets)
             if usap_jobs:
@@ -2778,7 +2798,7 @@ class CounselCollectorWindow(QMainWindow):
             else:
                 routed_map[source_court] = merge_dockets(routed_map.get(source_court, ""), raw_dockets)
 
-        if found_usap_jobs:
+        if found_usap_jobs or found_ca_feedback_jobs:
             selected_courts = [court for court in CIRCUIT_COURTS if court in routed_map]
             self.dockets_by_court = {court: routed_map[court] for court in selected_courts}
             has_generated_renames = any(
@@ -2801,8 +2821,9 @@ class CounselCollectorWindow(QMainWindow):
             self._update_run_button()
 
             total_dockets = sum(docket_count(job["docket_numbers"]) for job in self.output_jobs)
+            input_label = "CA feedback" if found_ca_feedback_jobs and not found_usap_jobs else "USAP"
             self._set_status(
-                f"Detected {total_dockets} USAP docket(s) across {len(selected_courts)} court(s) and {len(self.output_jobs)} folder(s).",
+                f"Detected {total_dockets} {input_label} docket(s) across {len(selected_courts)} court(s) and {len(self.output_jobs)} folder(s).",
                 "idle",
             )
             return True

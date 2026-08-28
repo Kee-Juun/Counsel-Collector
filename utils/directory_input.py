@@ -2,7 +2,7 @@ from pathlib import Path
 import re
 
 from utils.docket_input import (
-    COURT_CODE_TO_LABEL,
+    ca_code_to_court_label,
     canonical_usap_code,
     counsel_filename_for_main_document,
     default_output_folder_for_court,
@@ -10,6 +10,7 @@ from utils.docket_input import (
     extract_docket_numbers,
     merge_dockets,
     normalize_dockets,
+    output_folder_for_ca_code,
     output_folder_for_usap_code,
     unpublished_output_folder_for_court,
     usap_code_to_court_label,
@@ -17,7 +18,7 @@ from utils.docket_input import (
 
 
 CA_MARKER_RE = re.compile(
-    r"(?:^|[_\-\s])(?P<code>CA(?:1[01]|[1-9])|CA[_-]?DC|CADC)(?=[_\-\s.]|$)",
+    r"(?:^|[_\-\s])(?P<code>CA(?:1[01]|[1-9])U?|CA[_-]?DCU?|CADCU?|DCU?)(?=[_\-\s.]|$)",
     re.IGNORECASE,
 )
 USAP_MARKER_RE = re.compile(
@@ -52,6 +53,9 @@ def _route_sources(path, root):
 
 def _publication_hint(path, root):
     for source in _route_sources(path, root):
+        ca_match = CA_MARKER_RE.search(source)
+        if ca_match and ca_match.group("code").upper().replace("_", "").replace("-", "").endswith("U"):
+            return "unpublished"
         if UNPUBLISHED_MARKER_RE.search(source):
             return "unpublished"
         if PUBLISHED_MARKER_RE.search(source):
@@ -86,21 +90,17 @@ def _route_from_usap(path, root):
     return "", ""
 
 
-def _canonical_ca_code(code):
-    return code.upper().replace("_", "").replace("-", "")
-
-
 def _route_from_ca(path, root):
     for source in _route_sources(path, root):
         match = CA_MARKER_RE.search(source)
         if not match:
             continue
 
-        court_label = COURT_CODE_TO_LABEL.get(_canonical_ca_code(match.group("code")))
+        court_label = ca_code_to_court_label(match.group("code"))
         if court_label:
             output_folder = _output_folder_for_hint(
                 court_label,
-                default_output_folder_for_court(court_label),
+                output_folder_for_ca_code(match.group("code")) or default_output_folder_for_court(court_label),
                 _publication_hint(path, root),
             )
             return court_label, output_folder

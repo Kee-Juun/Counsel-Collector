@@ -1120,6 +1120,93 @@ def _is_counsel_renamed_row(row):
     return "counsel" in text
 
 
+def _is_pdf_renamed_row(row):
+    renamed = str(row.get("RENAMED") or "").strip().lower()
+    return bool(renamed.endswith(".pdf") and not _is_counsel_renamed_row(row))
+
+
+def _parent_filename_for_sibling(filename):
+    filename = str(filename or "").strip()
+    if not filename.lower().endswith(".pdf"):
+        return ""
+
+    return re.sub(
+        r"(?P<docket>(?<!\d)\d{2,4}-\d{1,6})(?P<suffix>[A-Za-z])(?=(_|\.|$))",
+        r"\g<docket>",
+        filename,
+        count=1,
+    )
+
+
+def _append_counsel_reference(row, parent_filename, counsel_filenames):
+    parent_filename = str(parent_filename or "").strip()
+    counsel_filenames = [str(value or "").strip() for value in counsel_filenames if str(value or "").strip()]
+    if not parent_filename:
+        return
+
+    reference = f"Covered by {parent_filename}"
+    if counsel_filenames:
+        reference = f"{reference}: {'; '.join(counsel_filenames)}"
+
+    existing = str(row.get("COUNSEL REFERENCE") or "").strip()
+    if not existing:
+        row["COUNSEL REFERENCE"] = reference
+    elif reference not in existing:
+        row["COUNSEL REFERENCE"] = f"{existing} | {reference}"
+
+
+def _apply_sibling_counsel_references(renamed_rows):
+    rows = [dict(row) for row in (renamed_rows or [])]
+    parent_by_key = {}
+    main_row_by_index = {}
+    current_main_index = None
+    counsel_indices_by_main = {}
+
+    for index, row in enumerate(rows):
+        if _is_pdf_renamed_row(row):
+            current_main_index = index
+            main_row_by_index[index] = row
+            parent_filename = _parent_filename_for_sibling(row.get("RENAMED", ""))
+            if parent_filename and parent_filename.lower() == str(row.get("RENAMED") or "").strip().lower():
+                key = (str(row.get("COURT") or "").strip(), parent_filename.lower())
+                parent_by_key.setdefault(key, index)
+            continue
+
+        if _is_counsel_renamed_row(row) and current_main_index is not None:
+            counsel_indices_by_main.setdefault(current_main_index, []).append(index)
+
+    remove_indices = set()
+    for main_index, row in main_row_by_index.items():
+        renamed = str(row.get("RENAMED") or "").strip()
+        parent_filename = _parent_filename_for_sibling(renamed)
+        if not parent_filename or parent_filename.lower() == renamed.lower():
+            continue
+
+        key = (str(row.get("COURT") or "").strip(), parent_filename.lower())
+        parent_index = parent_by_key.get(key)
+        if parent_index is None or parent_index == main_index:
+            continue
+
+        parent_counsel = [
+            str(rows[index].get("RENAMED") or "").strip()
+            for index in counsel_indices_by_main.get(parent_index, [])
+            if index not in remove_indices
+        ]
+        if not parent_counsel:
+            parent_counsel = [
+                str(rows[index].get("RENAMED") or "").strip()
+                for index in counsel_indices_by_main.get(main_index, [])
+            ]
+
+        _append_counsel_reference(row, parent_filename, parent_counsel)
+        remove_indices.update(counsel_indices_by_main.get(main_index, []))
+
+    if not remove_indices:
+        return rows
+
+    return [row for index, row in enumerate(rows) if index not in remove_indices]
+
+
 def _recycled_items_key(column):
     return f"__{column}_items"
 
@@ -1211,7 +1298,7 @@ def _run_irt_duplicate_preflight(
     stop_event,
     progress_callback,
 ):
-    renamed_rows = [dict(row) for row in (renamed_rows or [])]
+    renamed_rows = _apply_sibling_counsel_references(renamed_rows)
     total_dockets = sum(len(_split_dockets(route.get("docket_numbers", ""))) for route in output_routes)
     if total_dockets == 0:
         return {
@@ -1241,6 +1328,7 @@ def _run_irt_duplicate_preflight(
             )
 
             kept_dockets = []
+            filename_map = route.get("docket_output_filenames", {}) or {}
             for docket in _split_dockets(route.get("docket_numbers", "")):
                 _raise_if_cancelled(stop_event)
                 processed += 1
@@ -1248,7 +1336,13 @@ def _run_irt_duplicate_preflight(
                     max(1, min(99, int(processed / total_dockets * 100))),
                     f"Checking IRT duplicate {processed}/{total_dockets}: {docket}",
                 )
-                record = checker.find_existing_counsel_any(court_codes, docket, start_date, end_date)
+                record = checker.find_existing_counsel_any(
+                    court_codes,
+                    docket,
+                    start_date,
+                    end_date,
+                    expected_filename=filename_map.get(docket),
+                )
                 if record:
                     duplicate_count += 1
                     _annotate_recycled_counsel(renamed_rows, route, docket, record)

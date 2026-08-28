@@ -49,6 +49,17 @@ CODED_DOCKET_RE = re.compile(
 
 DOCKET_NUMBER_RE = re.compile(r"(?<!\d)\d{2,4}-\d{1,6}(?!\d)")
 FEEDBACK_FILENAME_RE = re.compile(r"\b(?:LDC|DC)_SMD_[^\s,;]+\.(?:pdf|html?|HTML?)\b", re.IGNORECASE)
+CA_FEEDBACK_ROW_RE = re.compile(
+    r"(?<!\S)(?P<code>CA(?:1[01]|[1-9])U?|CA[_-]?DCU?|CADCU?|DCU?)"
+    r"\s+(?P<filename>[^\s,;]+\.pdf)\b",
+    re.IGNORECASE,
+)
+SMD_CA_FILENAME_RE = re.compile(
+    r"\b(?P<filename>[^\s,;]*?SMD_(?P<docket>\d{2,4}-\d{1,6})_"
+    r"(?P<code>CA(?:1[01]|[1-9])|CA[_-]?DC|CADC|DC)(?=[_\-\s.])"
+    r"[^\s,;]*\.pdf)\b",
+    re.IGNORECASE,
+)
 DCORD_UNPUBLISHED_FLAG_RE = re.compile(
     r"(?P<base>(?<!\d)\d{2,4}-\d{1,6}(?:counsel(?:-\d+)?)?)u(?=(_|\.|$))",
     re.IGNORECASE,
@@ -75,6 +86,38 @@ def _ordinal_court_label(court_number):
     suffixes = {1: "st", 2: "nd", 3: "rd"}
     suffix = suffixes.get(court_number, "th")
     return f"{court_number}{suffix} Circuit Court"
+
+
+def canonical_ca_code(value):
+    raw = str(value or "").upper().replace("_", "").replace("-", "")
+    if raw in {"DC", "DCU"}:
+        return raw
+    if raw in {"CADC", "CADCU"}:
+        return raw
+
+    match = re.fullmatch(r"CA(?P<court>1[01]|[1-9])(?P<unpublished>U?)", raw)
+    if match:
+        return f"CA{int(match.group('court'))}{match.group('unpublished')}"
+
+    return ""
+
+
+def ca_code_to_court_label(value):
+    code = canonical_ca_code(value)
+    if not code:
+        return ""
+    lookup_code = code[:-1] if code.endswith("U") else code
+    return COURT_CODE_TO_LABEL.get(lookup_code, "")
+
+
+def output_folder_for_ca_code(value):
+    code = canonical_ca_code(value)
+    court_label = ca_code_to_court_label(code)
+    if not court_label:
+        return ""
+    if code.endswith("U"):
+        return unpublished_output_folder_for_court(court_label)
+    return default_output_folder_for_court(court_label)
 
 
 def canonical_usap_code(value):
@@ -316,6 +359,77 @@ def counsel_filename_for_main_document(filename, index=0, strip_dcord_unpublishe
         return f"{docket_match.group('prefix')}counsel{suffix}{marker}.htm"
 
     return f"{stem}counsel{suffix}.htm"
+
+
+def _docket_from_smd_ca_filename(filename):
+    match = SMD_CA_FILENAME_RE.search(filename or "")
+    if match:
+        return match.group("docket")
+
+    dockets = extract_docket_numbers(filename)
+    return dockets[0] if dockets else ""
+
+
+def parse_ca_feedback_rows(text):
+    grouped = {}
+    grouped_filenames = {}
+    renamed_rows = []
+    seen_files = set()
+
+    for match in CA_FEEDBACK_ROW_RE.finditer(text or ""):
+        raw_code = match.group("code")
+        filename = match.group("filename").replace("\\", "/").rsplit("/", 1)[-1]
+        if "counsel" in filename.lower():
+            continue
+
+        court_label = ca_code_to_court_label(raw_code)
+        output_folder = output_folder_for_ca_code(raw_code)
+        docket = _docket_from_smd_ca_filename(filename)
+        if not court_label or not output_folder or not docket:
+            continue
+
+        key = (court_label, output_folder)
+        grouped.setdefault(key, [])
+        grouped_filenames.setdefault(key, {})
+        grouped[key].append(docket)
+        grouped_filenames[key].setdefault(docket, counsel_filename_for_main_document(filename))
+
+        display_code = canonical_ca_code(raw_code) or raw_code.upper()
+        file_key = (display_code, filename.lower())
+        if file_key in seen_files:
+            continue
+        seen_files.add(file_key)
+
+        counsel_filename = grouped_filenames[key][docket]
+        renamed_rows.append(
+            {
+                "COURT": display_code,
+                "FEEDBACK FORM FILENAME": filename,
+                "RENAMED": filename,
+            }
+        )
+        renamed_rows.append(
+            {
+                "COURT": display_code,
+                "FEEDBACK FORM FILENAME": "",
+                "RENAMED": counsel_filename,
+            }
+        )
+
+    jobs = []
+    for (court_label, output_folder), dockets in grouped.items():
+        normalized_dockets = merge_dockets(", ".join(dockets))
+        if normalized_dockets:
+            jobs.append(
+                {
+                    "court_label": court_label,
+                    "docket_numbers": normalized_dockets,
+                    "output_folder": output_folder,
+                    "docket_output_filenames": grouped_filenames.get((court_label, output_folder), {}),
+                }
+            )
+
+    return jobs, renamed_rows
 
 
 def _counsel_index_for_filename(filename, main_parts):
