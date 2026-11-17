@@ -121,7 +121,7 @@ def _fallback_route(selected_courts, path, root):
     return court_label, output_folder
 
 
-def parse_pdf_directory(directory, selected_courts=None):
+def parse_pdf_directory(directory, selected_courts=None, include_existing_counsel=False):
     root = Path(directory)
     selected_courts = [court for court in (selected_courts or []) if court]
     files = sorted((path for path in root.rglob("*") if path.is_file()), key=lambda path: str(path).lower())
@@ -176,7 +176,7 @@ def parse_pdf_directory(directory, selected_courts=None):
             continue
 
         key = (court_label, output_folder)
-        if docket in counsel_dockets_by_route.get(key, set()):
+        if not include_existing_counsel and docket in counsel_dockets_by_route.get(key, set()):
             skipped_existing.append(label)
             continue
 

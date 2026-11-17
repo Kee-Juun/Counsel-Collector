@@ -35,6 +35,16 @@ RENAMED_COLUMNS = (
     "COUNSEL REFERENCE",
 )
 
+IRT_CHECK_COLUMNS = (
+    "Court",
+    "Docket Number",
+    "Status",
+    "RECYCLED COUNSEL LNI",
+    "MOST RECENT RECEIVED DATE",
+    "IRT Court Code",
+    "Message",
+)
+
 
 COLUMN_WIDTH_LIMITS = {
     "Court": (12, 24),
@@ -317,6 +327,7 @@ class RunArtifacts:
     debug_dir: Path
     records: list = field(default_factory=list)
     renamed_records: list = field(default_factory=list)
+    irt_check_records: list = field(default_factory=list)
 
     @classmethod
     def create(cls):
@@ -393,6 +404,13 @@ class RunArtifacts:
         for record in self.renamed_records:
             renamed_rows.append([record.get(column, "") for column in RENAMED_COLUMNS])
         sheets = [("Results", rows), ("Renamed", renamed_rows)]
+        if self.irt_check_records:
+            check_rows = [IRT_CHECK_COLUMNS]
+            check_rows.extend(
+                [record.get(column, "") for column in IRT_CHECK_COLUMNS]
+                for record in self.irt_check_records
+            )
+            sheets.insert(0, ("IRT Check", check_rows))
         write_xlsx(self.summary_path, sheets)
         self.log(f"Saved Excel summary: {self.summary_path}")
 

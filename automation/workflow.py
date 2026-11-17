@@ -28,6 +28,8 @@ from config.app_settings import (
     LEXIS_SEARCH_URL,
     NO_RESULT_PHRASES,
     RESULT_LINK_SELECTORS,
+    RUN_MODE_COLLECTION,
+    RUN_MODE_IRT_CHECK,
 )
 from utils.docket_input import default_output_folder_for_court
 
@@ -1297,6 +1299,7 @@ def _run_irt_duplicate_preflight(
     headless,
     stop_event,
     progress_callback,
+    irt_check_only=False,
 ):
     renamed_rows = _apply_sibling_counsel_references(renamed_rows)
     total_dockets = sum(len(_split_dockets(route.get("docket_numbers", ""))) for route in output_routes)
@@ -1312,7 +1315,10 @@ def _run_irt_duplicate_preflight(
     artifacts.log(f"IRT received date range: {start_date} to {end_date}")
     progress_callback(0, f"Starting IRT duplicate check for {total_dockets} docket(s)...")
 
-    checker = IRTDuplicateChecker(logger=artifacts, headless=headless, stop_event=stop_event)
+    checker = IRTDuplicateChecker(
+        logger=artifacts, headless=headless, stop_event=stop_event,
+        strict_timeouts=irt_check_only,
+    )
     filtered_routes = []
     duplicate_count = 0
     processed = 0
@@ -1336,13 +1342,36 @@ def _run_irt_duplicate_preflight(
                     max(1, min(99, int(processed / total_dockets * 100))),
                     f"Checking IRT duplicate {processed}/{total_dockets}: {docket}",
                 )
-                record = checker.find_existing_counsel_any(
-                    court_codes,
-                    docket,
-                    start_date,
-                    end_date,
-                    expected_filename=filename_map.get(docket),
-                )
+                check_row = {
+                    "Court": output_folder,
+                    "Docket Number": docket,
+                    "Status": "Not checked",
+                }
+                try:
+                    record = checker.find_existing_counsel_any(
+                        court_codes,
+                        docket,
+                        start_date,
+                        end_date,
+                        expected_filename=None if irt_check_only else filename_map.get(docket),
+                    )
+                except Exception as exc:
+                    if irt_check_only:
+                        check_row["Status"] = "Cancelled" if isinstance(exc, RunCancelled) else "Failed"
+                        check_row["Message"] = str(exc)
+                        artifacts.irt_check_records.append(check_row)
+                    raise
+                if irt_check_only:
+                    check_row.update({
+                        "Status": "Found" if record else "Not found",
+                        "RECYCLED COUNSEL LNI": (record or {}).get("LNI", ""),
+                        "MOST RECENT RECEIVED DATE": (record or {}).get("Received Date", ""),
+                        "IRT Court Code": (record or {}).get("IRT Court Code", ""),
+                        "Message": (
+                            f"Checked {', '.join(court_codes)}; received {start_date} to {end_date}."
+                        ),
+                    })
+                    artifacts.irt_check_records.append(check_row)
                 if record:
                     duplicate_count += 1
                     _annotate_recycled_counsel(renamed_rows, route, docket, record)
@@ -1403,11 +1432,15 @@ def run_searches(
     stop_event=None,
     renamed_rows=None,
     directory_copy_target=None,
+    run_mode=RUN_MODE_COLLECTION,
 ):
     if progress_callback is None:
         def progress_callback(percent, text):
             print(f"[{percent}%] {text}")
 
+    if run_mode not in {RUN_MODE_COLLECTION, RUN_MODE_IRT_CHECK}:
+        return _empty_result(f"Unknown run mode: {run_mode}")
+    irt_check_only = run_mode == RUN_MODE_IRT_CHECK
     raw_output_routes = _normalize_search_jobs(court_dockets)
     if not raw_output_routes:
         return _empty_result("No court/docket jobs were provided.")
@@ -1426,6 +1459,10 @@ def run_searches(
         "failed": 0,
         "no_results": 0,
         "duplicates": 0,
+        "run_mode": run_mode,
+        "total_dockets": sum(len(_split_dockets(route["docket_numbers"])) for route in raw_output_routes),
+        "checked": 0,
+        "not_found": 0,
         "cancelled": False,
         "files": [],
         "run_dir": str(artifacts.run_dir),
@@ -1437,6 +1474,7 @@ def run_searches(
 
     try:
         _raise_if_cancelled(stop_event)
+        artifacts.log(f"Run mode: {'IRT Check Only' if irt_check_only else 'Counsel Collection'}")
         preflight = _run_irt_duplicate_preflight(
             raw_output_routes,
             renamed_rows,
@@ -1444,10 +1482,22 @@ def run_searches(
             headless,
             stop_event,
             progress_callback,
+            irt_check_only=irt_check_only,
         )
         output_routes = preflight["output_routes"]
         artifacts.renamed_records.extend(preflight["renamed_rows"])
         result["duplicates"] = preflight["duplicates"]
+
+        if irt_check_only:
+            result["success"] = True
+            result["message"] = (
+                f"IRT check complete: {result['total_dockets']} docket(s) checked; "
+                f"{result['duplicates']} existing counsel LNI match(es); "
+                f"{result['total_dockets'] - result['duplicates']} not found in the search window. "
+                "No CourtLink collection was started."
+            )
+            artifacts.log(result["message"])
+            return result
 
         if not output_routes:
             result["success"] = True
@@ -1645,7 +1695,7 @@ def run_searches(
         return result
 
     except RunCancelled:
-        message = "Collection cancelled by user."
+        message = "IRT check cancelled by user." if irt_check_only else "Collection cancelled by user."
         result["message"] = message
         result["cancelled"] = True
         result["success"] = False
@@ -1676,6 +1726,28 @@ def run_searches(
         progress_callback(100, "Closing browser...")
         if driver:
             driver.quit()
+        if irt_check_only:
+            reported = {
+                (row["Court"], row["Docket Number"]) for row in artifacts.irt_check_records
+            }
+            for route in raw_output_routes:
+                for docket in _split_dockets(route["docket_numbers"]):
+                    key = (route["output_folder"], docket)
+                    if key not in reported:
+                        artifacts.irt_check_records.append({
+                            "Court": key[0], "Docket Number": docket, "Status": "Not checked",
+                            "Message": "The run ended before this docket could be checked.",
+                        })
+                        reported.add(key)
+            result["checked"] = sum(
+                row["Status"] in {"Found", "Not found"} for row in artifacts.irt_check_records
+            )
+            result["duplicates"] = sum(row["Status"] == "Found" for row in artifacts.irt_check_records)
+            result["not_found"] = sum(row["Status"] == "Not found" for row in artifacts.irt_check_records)
+            artifacts.log(
+                f"IRT summary: checked {result['checked']}/{result['total_dockets']}; "
+                f"found {result['duplicates']}; not found {result['not_found']}."
+            )
         artifacts.save_summary()
         if directory_copy_target:
             try:
@@ -1683,7 +1755,8 @@ def run_searches(
                 result["directory_copied_paths"] = copied_paths
                 if copied_paths:
                     artifacts.log(
-                        f"Copied counsel output folder(s) and Output workbook to source directory: {directory_copy_target}"
+                        f"Copied {'IRT check report' if irt_check_only else 'counsel output folder(s) and Output workbook'} "
+                        f"to source directory: {directory_copy_target}"
                     )
                 else:
                     artifacts.log(
@@ -1705,6 +1778,7 @@ def run_search(
     stop_event=None,
     renamed_rows=None,
     directory_copy_target=None,
+    run_mode=RUN_MODE_COLLECTION,
 ):
     return run_searches(
         {selected_court_label: docket_numbers},
@@ -1715,4 +1789,5 @@ def run_search(
         stop_event=stop_event,
         renamed_rows=renamed_rows,
         directory_copy_target=directory_copy_target,
+        run_mode=run_mode,
     )

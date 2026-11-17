@@ -174,10 +174,11 @@ class IRTDuplicateChecker:
         "no records found",
     )
 
-    def __init__(self, logger=None, headless=True, stop_event=None):
+    def __init__(self, logger=None, headless=True, stop_event=None, strict_timeouts=False):
         self.logger = logger
         self.headless = headless
         self.stop_event = stop_event
+        self.strict_timeouts = strict_timeouts
         self.driver = None
         self._initialized = False
         self._ocr_unavailable_reason = None
@@ -678,7 +679,12 @@ class IRTDuplicateChecker:
 
             try:
                 self._click_search_and_wait()
-            except TimeoutException:
+            except TimeoutException as exc:
+                if self.strict_timeouts:
+                    raise IRTDuplicateCheckError(
+                        f"IRT search timed out for {court_code}, docket {docket_number}; "
+                        "the result could not be confirmed."
+                    ) from exc
                 _log(self.logger, f"No IRT results confirmed for docket {docket_number}.")
                 continue
 

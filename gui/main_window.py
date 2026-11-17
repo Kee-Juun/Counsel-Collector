@@ -50,6 +50,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListView,
     QMainWindow,
     QPlainTextEdit,
     QProgressBar,
@@ -62,7 +63,7 @@ from PyQt5.QtWidgets import (
 )
 
 from automation.workflow import DOCKET_BATCH_SIZE, run_searches
-from config.app_settings import APP_NAME, CIRCUIT_COURTS, RUNS_ROOT
+from config.app_settings import APP_NAME, CIRCUIT_COURTS, RUNS_ROOT, RUN_MODE_COLLECTION, RUN_MODE_IRT_CHECK
 from utils.docket_input import (
     default_output_folder_for_court,
     docket_count,
@@ -345,6 +346,52 @@ class CourtMultiSelectCombo(QComboBox):
         else:
             text = f"{len(labels)} courts selected"
         self.lineEdit().setText(text)
+
+
+class DownwardComboBox(QComboBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        view = QListView(self)
+        view.setFrameShape(QFrame.NoFrame)
+        view.setUniformItemSizes(True)
+        view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setView(view)
+
+    def showPopup(self):
+        popup = self.view().window()
+        if popup is not self and isinstance(popup, QFrame):
+            popup.setObjectName("ModePopupContainer")
+            popup.setWindowFlags(popup.windowFlags() | Qt.FramelessWindowHint)
+            popup.setFrameShape(QFrame.NoFrame)
+            popup.setLineWidth(0)
+            popup.setMidLineWidth(0)
+            popup.setAutoFillBackground(False)
+            popup.setAttribute(Qt.WA_TranslucentBackground, True)
+
+        super().showPopup()
+        popup = self.view().window()
+        if popup is self:
+            return
+
+        visible_rows = min(self.count(), self.maxVisibleItems())
+        row_height = self.view().sizeHintForRow(0)
+        if row_height <= 0:
+            row_height = self.fontMetrics().height() + 14
+        popup_height = row_height * visible_rows + 10
+        popup_width = max(self.width(), popup.width())
+        position = self.mapToGlobal(QPoint(0, self.height()))
+
+        screen = self.screen()
+        if screen:
+            available = screen.availableGeometry()
+            if position.y() + popup_height > available.bottom() + 1:
+                above_y = self.mapToGlobal(QPoint(0, 0)).y() - popup_height
+                if above_y >= available.top():
+                    position.setY(above_y)
+            position.setX(max(available.left(), min(position.x(), available.right() - popup_width + 1)))
+
+        popup.setGeometry(position.x(), position.y(), popup_width, popup_height)
 
 
 class DocketListPopup(QFrame):
@@ -1572,7 +1619,8 @@ class SearchWorker(QObject):
     progress = pyqtSignal(int, str)
     finished = pyqtSignal(bool, str, object)
 
-    def __init__(self, court_dockets, username, password, headless, renamed_rows=None, directory_copy_target=None):
+    def __init__(self, court_dockets, username, password, headless, renamed_rows=None, directory_copy_target=None,
+                 run_mode=RUN_MODE_COLLECTION):
         super().__init__()
         self.court_dockets = court_dockets
         self.username = username
@@ -1580,6 +1628,7 @@ class SearchWorker(QObject):
         self.headless = headless
         self.renamed_rows = renamed_rows or []
         self.directory_copy_target = directory_copy_target
+        self.run_mode = run_mode
         self.cancel_event = Event()
 
     def cancel(self):
@@ -1599,6 +1648,7 @@ class SearchWorker(QObject):
                 stop_event=self.cancel_event,
                 renamed_rows=self.renamed_rows,
                 directory_copy_target=self.directory_copy_target,
+                run_mode=self.run_mode,
             )
             if not isinstance(result, dict):
                 result = {
@@ -1975,8 +2025,25 @@ class CounselCollectorWindow(QMainWindow):
         self.settings_btn.clicked.connect(self._toggle_settings_popup)
         self.settings_btn.raise_()
 
+        mode_row = QHBoxLayout()
+        mode_row.setContentsMargins(0, 0, 34, 0)
+        mode_row.setSpacing(12)
+        mode_row.addWidget(self._label("Mode"))
+        self.mode_combo = DownwardComboBox()
+        self.mode_combo.setObjectName("ModeCombo")
+        self.mode_combo.addItem("Counsel Collection", RUN_MODE_COLLECTION)
+        self.mode_combo.addItem("IRT Check Only", RUN_MODE_IRT_CHECK)
+        self.mode_combo.setMaxVisibleItems(2)
+        self.mode_combo.setToolTip(
+            "IRT Check Only finds existing counsel LNIs by court and docket. "
+            "It does not open CourtLink or download counsel."
+        )
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        mode_row.addWidget(self.mode_combo, 1)
+        card_layout.addLayout(mode_row)
+
         form_grid = QGridLayout()
-        form_grid.setContentsMargins(0, 34, 0, 0)
+        form_grid.setContentsMargins(0, 0, 0, 0)
         form_grid.setHorizontalSpacing(14)
         form_grid.setVerticalSpacing(9)
         form_grid.addWidget(self._label("Lexis ID"), 0, 0)
@@ -2220,6 +2287,32 @@ class CounselCollectorWindow(QMainWindow):
                 color: #f8fafc;
                 border: 1px solid #22304a;
                 selection-background-color: #1d4ed8;
+            }
+            QComboBox#ModeCombo QAbstractItemView {
+                background-color: #101722;
+                color: #f8fafc;
+                border: 1px solid #2b465d;
+                border-radius: 10px;
+                padding: 4px;
+                outline: none;
+                selection-background-color: #22d3ee;
+            }
+            QFrame#ModePopupContainer {
+                background-color: transparent;
+                border: none;
+            }
+            QComboBox#ModeCombo QAbstractItemView::item {
+                min-height: 18px;
+                padding: 6px 10px;
+                border-radius: 6px;
+            }
+            QComboBox#ModeCombo QAbstractItemView::item:selected {
+                color: #08111f;
+                background-color: #22d3ee;
+            }
+            QComboBox#ModeCombo QAbstractItemView::item:hover {
+                color: #f8fafc;
+                background-color: #173047;
             }
             QCheckBox {
                 color: #cbd5e1;
@@ -2678,14 +2771,26 @@ class CounselCollectorWindow(QMainWindow):
             self._restart_idle_timer()
             return
 
-        self.directory_copy_target = None
-        result = parse_pdf_directory(folder, selected_courts=self._selected_courts())
+        self._load_docket_directory(folder)
+
+    def _load_docket_directory(self, folder):
+        self.directory_copy_target = folder
+        result = parse_pdf_directory(
+            folder, selected_courts=self._selected_courts(),
+            include_existing_counsel=self._irt_check_only(),
+        )
         jobs = result.get("jobs", [])
         tooltip = self._directory_result_tooltip(result)
         folder_name = Path(folder).name
 
         if not jobs:
-            reason = "No collectable PDF dockets were found."
+            self.output_jobs = []
+            self.renamed_rows = []
+            self.dockets_by_court = {}
+            self.court_combo.set_checked_items([], emit=False)
+            self._refresh_docket_display()
+            self._update_run_button()
+            reason = "No PDF dockets were found to check." if self._irt_check_only() else "No collectable PDF dockets were found."
             if result.get("skipped_unknown_court"):
                 reason += (
                     "\n\nSome PDFs did not have a court marker. Select one court first, "
@@ -2893,14 +2998,31 @@ class CounselCollectorWindow(QMainWindow):
         finally:
             self.refreshing_docket_display = False
 
+    def _irt_check_only(self):
+        return self.mode_combo.currentData() == RUN_MODE_IRT_CHECK
+
+    def _on_mode_changed(self):
+        check_only = self._irt_check_only()
+        self.username_input.setEnabled(not check_only)
+        self.password_input.setEnabled(not check_only)
+        tooltip = "IRT uses your existing access; Lexis credentials are not needed for this mode." if check_only else ""
+        self.username_input.setToolTip(tooltip)
+        self.password_input.setToolTip(tooltip)
+        self.run_btn.setText("Check IRT" if check_only else "Collect")
+        self._update_run_button()
+        self._set_status("Ready to check IRT." if check_only else "Ready to collect counsel.", "idle")
+        if self.directory_copy_target:
+            self._load_docket_directory(self.directory_copy_target)
+
     def _update_run_button(self):
         selected_courts = self._selected_courts()
         has_dockets = bool(selected_courts) and all(
             normalize_dockets(self.dockets_by_court.get(court_label, "")) for court_label in selected_courts
         )
         ready = (
-            bool(self.username_input.text().strip())
-            and bool(self.password_input.text())
+            (self._irt_check_only() or (
+                bool(self.username_input.text().strip()) and bool(self.password_input.text())
+            ))
             and has_dockets
         )
         self.run_btn.setEnabled(ready)
@@ -3226,6 +3348,17 @@ class CounselCollectorWindow(QMainWindow):
 
     def _set_final_status(self, message, state, result):
         if isinstance(result, dict):
+            if result.get("run_mode") == RUN_MODE_IRT_CHECK:
+                display = (
+                    "IRT check complete." if state == "success" else
+                    "IRT check cancelled." if result.get("cancelled") else "IRT check failed."
+                )
+                tooltip = (
+                    f"Checked {result.get('checked', 0)}/{result.get('total_dockets', 0)}\n"
+                    f"Found {result.get('duplicates', 0)}\nNot found {result.get('not_found', 0)}\n{message}"
+                )
+                self._set_status(display, state, tooltip=tooltip)
+                return
             found = result.get("found", 0)
             saved = result.get("saved", 0)
             failed = result.get("failed", 0)
@@ -3259,7 +3392,7 @@ class CounselCollectorWindow(QMainWindow):
             self.shell.set_watermark_active(False)
         self.progress.setValue(0)
         self._reset_run_context()
-        self._set_status("Ready to collect counsel.", "idle")
+        self._set_status("Ready to check IRT." if self._irt_check_only() else "Ready to collect counsel.", "idle")
         self.stack.setCurrentWidget(self.setup_page)
         self._update_run_button()
         self._restart_idle_timer()
@@ -3294,7 +3427,7 @@ class CounselCollectorWindow(QMainWindow):
         }
         missing_courts = [court_label for court_label, dockets in court_dockets.items() if not dockets]
 
-        if not username or not password:
+        if not self._irt_check_only() and (not username or not password):
             self._show_prompt("Missing Credentials", "Please enter both Lexis ID and password.", "warning")
             return
         if not selected_courts:
@@ -3311,7 +3444,7 @@ class CounselCollectorWindow(QMainWindow):
         collection_jobs = self.output_jobs or court_dockets
         self.progress.setValue(0)
         self._configure_run_context(collection_jobs)
-        self._set_run_status("Starting collection...", "running")
+        self._set_run_status("Starting IRT check..." if self._irt_check_only() else "Starting collection...", "running")
         self.cancel_run_btn.setText("Cancel Run")
         self.cancel_run_btn.setEnabled(True)
         self.run_view_btn.setEnabled(False)
@@ -3324,6 +3457,7 @@ class CounselCollectorWindow(QMainWindow):
             headless=self.headless_checkbox.isChecked(),
             renamed_rows=self.renamed_rows,
             directory_copy_target=self.directory_copy_target,
+            run_mode=self.mode_combo.currentData(),
         )
         self.worker_thread = QThread()
         self.worker.moveToThread(self.worker_thread)
@@ -3391,7 +3525,7 @@ class CounselCollectorWindow(QMainWindow):
             elif result.get("directory_copied_paths"):
                 copy_note = f"\n\nCopies were also placed in:\n{result['directory_copy_target']}"
         self._show_prompt(
-            "Collection Complete",
+            "IRT Check Complete" if result.get("run_mode") == RUN_MODE_IRT_CHECK else "Collection Complete",
             f"{message}{copy_note}\n\nThe run folder will open after you click OK.",
             "success",
         )
@@ -3406,6 +3540,8 @@ class CounselCollectorWindow(QMainWindow):
 
         run_dir = Path(result.get("run_dir") or self.current_results_dir)
         title = "Collection Cancelled" if result.get("cancelled") else "Collection Failed"
+        if result.get("run_mode") == RUN_MODE_IRT_CHECK:
+            title = "IRT Check Cancelled" if result.get("cancelled") else "IRT Check Failed"
         copy_note = ""
         if result.get("directory_copy_target"):
             if result.get("directory_copy_error"):

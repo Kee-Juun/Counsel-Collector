@@ -2,6 +2,8 @@ from pathlib import Path
 
 
 APP_NAME = "Counsel Collector"
+RUN_MODE_COLLECTION = "collect"
+RUN_MODE_IRT_CHECK = "irt_check_only"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 RUNS_ROOT = Path.home() / "Downloads" / APP_NAME

@@ -34,6 +34,17 @@ python main.py
 - Lexis accepts up to 10 docket numbers per search, so the app automatically splits larger court lists into 10-docket batches while keeping all output in the same court folder.
 - Before CourtLink collection starts, the app checks IRT for existing counsel files using the routed court code, docket number, expected counsel filename when available, and a two-year received-date window ending today. Dockets already found in IRT are skipped and documented in the `Renamed` sheet with `RECYCLED COUNSEL LNI` and `MOST RECENT RECEIVED DATE`. When multiple related counsel filenames exist, the app verifies candidate content before recycling the LNI; if normal page text cannot be verified, it can use OCR as a fallback when Tesseract OCR is installed.
 
+## IRT Check Only
+
+Select **IRT Check Only** in the **Mode** dropdown, enter or paste your courts and dockets (or load a PDF folder), and click **Check IRT**.
+
+- Checks by court and docket number with the `*counsel*` filename filter. It checks the circuit's published and unpublished IRT codes and uses the most recently received matching record.
+- Stops after IRT checking, including when no match exists. It does not start CourtLink, log into Lexis, or download new counsel documents. Lexis ID/password are not required in this mode; your normal IRT access is still required.
+- Uses the existing two-year received-date window ending today. **Not found** means no matching counsel was found in that window.
+- Writes an **IRT Check** sheet in the run's `Report_*.xlsx` workbook with court, docket, Found/Not found status, recycled counsel LNI, most recent received date, and matching IRT court code. Failed, cancelled, and unattempted checks are labeled separately.
+- Folder loading includes PDFs even when matching local counsel files exist. Switching modes reloads a previously loaded folder using that mode's rules. For folder-loaded runs, only the report is copied back to the source folder in this mode.
+- Switch back to **Counsel Collection** for the usual IRT preflight followed by CourtLink collection of missing counsel.
+
 Example smart paste:
 
 ```text
